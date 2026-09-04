@@ -11,6 +11,7 @@ import { M18V3Definition } from './M18V3.js'
 import { Ajaz_AKP153Definition } from './Ajazz-AKP153.js'
 import { Ajaz_AKP153EDefinition } from './Ajazz-AKP153E.js'
 import { Ajaz_AKP03EDefinition } from './Ajazz-AKP03E.js'
+import { Fifine_D6Definition } from './Fifine-D6.js'
 
 export interface StreamDockModelDefinition {
 	productName: string
@@ -27,6 +28,34 @@ export interface StreamDockModelDefinition {
 
 	/** If set, additional configuration options will be available */
 	configFields?: Array<SomeCompanionInputField>
+
+	/**
+	 * Per-productId transport overrides, for hardware revisions which share the rest of this model
+	 * definition but need different handling to reliably accept image draw data.
+	 */
+	quirksByProductId?: Record<number, StreamDockProductQuirks>
+}
+
+/**
+ * Experimental per hardware-revision overrides for the LCD image draw transport.
+ * Used to work around firmware revisions which are stricter about write ordering/pacing
+ * than the original revision the driver was written against.
+ */
+export interface StreamDockProductQuirks {
+	/**
+	 * Chunk size (in bytes) to use when splitting LCD image data into packets.
+	 * Falls back to the model's packetSize when unset.
+	 */
+	drawChunkSize?: number
+	/** Milliseconds to pause after each image data chunk is written, to avoid saturating the device's input buffer */
+	drawChunkDelayMs?: number
+	/**
+	 * Write the image header and pixel data chunks sequentially (awaiting each one), and wait for them to
+	 * finish before sending the refresh/present command, instead of firing them all without waiting.
+	 */
+	sequentialImageWrites?: boolean
+	/** Compress LCD images using BGR pixel order instead of RGB */
+	swapColorOrder?: boolean
 }
 export interface StreamDockInputDefinition {
 	type: 'button' | 'push' | 'rotateLeft' | 'rotateRight' | 'swipeLeft' | 'swipeRight'
@@ -83,4 +112,5 @@ export const AllModels: StreamDockModelDefinition[] = [
 	Ajaz_AKP153Definition,
 	Ajaz_AKP153EDefinition,
 	Ajaz_AKP03EDefinition,
+	Fifine_D6Definition,
 ]

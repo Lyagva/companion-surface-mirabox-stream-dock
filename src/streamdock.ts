@@ -1,7 +1,13 @@
 import type { HIDDevice } from '@companion-surface/base'
 import type { HIDAsync } from 'node-hid'
 import EventEmitter from 'node:events'
-import type { StreamDockInputDefinition, StreamDockModelDefinition, StreamDockOutputDefinition } from './models/list.js'
+import { setTimeout as delay } from 'node:timers/promises'
+import type {
+	StreamDockInputDefinition,
+	StreamDockModelDefinition,
+	StreamDockOutputDefinition,
+	StreamDockProductQuirks,
+} from './models/list.js'
 import jpg from '@julusian/jpeg-turbo'
 
 export interface StreamDockEvents {
@@ -23,9 +29,15 @@ export class StreamDock extends EventEmitter<StreamDockEvents> {
 	private readonly device: HIDAsync
 	private readonly model: StreamDockModelDefinition
 	private heartbeatInterval: NodeJS.Timeout | undefined
+	private writeQueue: Promise<unknown> = Promise.resolve()
 
 	get packetSize(): number {
 		return this.model.packetSize ?? 1024
+	}
+
+	/** Transport overrides for this specific hardware revision (matched by productId), if any are defined */
+	private get quirks(): StreamDockProductQuirks | undefined {
+		return this.model.quirksByProductId?.[this.info.productId]
 	}
 
 	constructor(deviceInfo: HIDDevice, device: HIDAsync, model: StreamDockModelDefinition) {
@@ -81,19 +93,34 @@ export class StreamDock extends EventEmitter<StreamDockEvents> {
 		this.heartbeatInterval = setInterval(() => void this.sendHeartbeat(), 8000)
 	}
 
+	/**
+	 * Runs a write task only once every previously queued write has settled, so bytes belonging to
+	 * different commands/images never interleave on the wire when writes are triggered concurrently.
+	 */
+	private async enqueueWrite<T>(task: () => Promise<T>): Promise<T> {
+		const result = this.writeQueue.then(task, task)
+		this.writeQueue = result.then(
+			() => undefined,
+			() => undefined,
+		)
+		return result
+	}
+
 	private async sendCmdSimple(dataArr: Array<number>): Promise<void> {
-		const data = Buffer.from(dataArr)
+		return this.enqueueWrite(async () => {
+			const data = Buffer.from(dataArr)
 
-		const prefixbuffer = Buffer.from(StreamDock.cmdPrefix)
-		const writebuffer = Buffer.concat([Buffer.from([0]), prefixbuffer, data], this.packetSize + 1)
+			const prefixbuffer = Buffer.from(StreamDock.cmdPrefix)
+			const writebuffer = Buffer.concat([Buffer.from([0]), prefixbuffer, data], this.packetSize + 1)
 
-		if (dataArr.length + prefixbuffer.byteLength > this.packetSize) {
-			console.error(
-				`Data length problem while sending packet to stream dock. Should be ${this.packetSize}B, but is ${dataArr.length + prefixbuffer.byteLength}B`,
-			)
-		}
+			if (dataArr.length + prefixbuffer.byteLength > this.packetSize) {
+				console.error(
+					`Data length problem while sending packet to stream dock. Should be ${this.packetSize}B, but is ${dataArr.length + prefixbuffer.byteLength}B`,
+				)
+			}
 
-		await this.writeRaw(writebuffer)
+			await this.writeRaw(writebuffer)
+		})
 	}
 
 	/**
@@ -104,20 +131,43 @@ export class StreamDock extends EventEmitter<StreamDockEvents> {
 	 * @param prefix optional prefix. If not set, the default prefix will be used
 	 */
 	private async sendDrawKeyCmd(data: Buffer): Promise<void> {
-		const ps: Promise<void>[] = []
+		return this.enqueueWrite(async () => {
+			const quirks = this.quirks
+			const chunkSize = quirks?.drawChunkSize ?? this.packetSize
 
-		for (let offset = 0; offset < data.byteLength; offset += this.packetSize) {
-			const chunk = data.subarray(offset, offset + this.packetSize)
-			const writebuffer = Buffer.concat([Buffer.from([0]), chunk], this.packetSize + 1)
+			if (quirks?.sequentialImageWrites) {
+				// Some hardware revisions drop/blank the frame if pixel chunks arrive out of order or the device's
+				// internal receive buffer is saturated. Write chunks one at a time, pausing briefly between each,
+				// instead of flooding the device with concurrent writes.
+				const chunkDelayMs = quirks.drawChunkDelayMs ?? 0
+				for (let offset = 0; offset < data.byteLength; offset += chunkSize) {
+					const chunk = data.subarray(offset, offset + chunkSize)
+					const writebuffer = Buffer.concat([Buffer.from([0]), chunk], chunkSize + 1)
 
-			ps.push(
-				this.writeRaw(writebuffer).catch((e) => {
-					throw new Error('Sending command to Stream Dock failed ' + e)
-				}),
-			)
-		}
+					await this.writeRaw(writebuffer).catch((e) => {
+						throw new Error('Sending command to Stream Dock failed ' + e)
+					})
 
-		await Promise.all(ps)
+					await delay(chunkDelayMs)
+				}
+				return
+			}
+
+			const ps: Promise<void>[] = []
+
+			for (let offset = 0; offset < data.byteLength; offset += chunkSize) {
+				const chunk = data.subarray(offset, offset + chunkSize)
+				const writebuffer = Buffer.concat([Buffer.from([0]), chunk], chunkSize + 1)
+
+				ps.push(
+					this.writeRaw(writebuffer).catch((e) => {
+						throw new Error('Sending command to Stream Dock failed ' + e)
+					}),
+				)
+			}
+
+			await Promise.all(ps)
+		})
 	}
 
 	get serialNumber(): string {
@@ -211,6 +261,8 @@ export class StreamDock extends EventEmitter<StreamDockEvents> {
 
 		// console.log('sending image', column, row, output.id)
 
+		const quirks = this.quirks
+
 		let imgData: Buffer = Buffer.from([])
 		let size = 0xffffff
 		let quality: number
@@ -218,7 +270,7 @@ export class StreamDock extends EventEmitter<StreamDockEvents> {
 		for (quality = 90; quality > 11; quality -= 10) {
 			// 90% quality will fit almost all images in the 10k limit
 			const options = {
-				format: jpg.FORMAT_RGB,
+				format: quirks?.swapColorOrder ? jpg.FORMAT_BGR : jpg.FORMAT_RGB,
 				width: output.resolutionx,
 				height: output.resolutiony,
 				subsampling: jpg.SAMP_422,
@@ -246,7 +298,7 @@ export class StreamDock extends EventEmitter<StreamDockEvents> {
 
 		// console.log(`image ${row}/${column} size ${size}B compression ${quality}%`)
 
-		this.sendCmdSimple([
+		const header = this.sendCmdSimple([
 			0x42,
 			0x41,
 			0x54,
@@ -258,9 +310,17 @@ export class StreamDock extends EventEmitter<StreamDockEvents> {
 		]).catch((e) => {
 			console.error('Sending set image command to Stream Dock failed ' + e)
 		})
-		this.sendDrawKeyCmd(imgData).catch((e) => {
+		const body = this.sendDrawKeyCmd(imgData).catch((e) => {
 			console.error('Sending image data to Stream Dock failed ' + e)
 		})
+
+		if (quirks?.sequentialImageWrites) {
+			// The header and pixel data must be fully flushed before refresh/present is sent, otherwise this
+			// revision presents a stale/blank framebuffer.
+			await header
+			await body
+		}
+
 		await this.refresh()
 	}
 
