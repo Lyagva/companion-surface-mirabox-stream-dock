@@ -11,6 +11,22 @@ export const Fifine_D6Definition: StreamDockModelDefinition = {
 		},
 	],
 
+	quirksByProductId: {
+		// PID 0x0060 is a newer hardware revision. Buttons/brightness (small, single-packet writes) work fine,
+		// but LCD image draws leave the screens black. This points at the header/pixel-data writes racing the
+		// refresh/present command rather than a transport-level (HID report vs endpoint) difference, since both
+		// use the same write() path as the working brightness command. These settings force the header and
+		// pixel chunks to be flushed - in order - before refresh is sent, and pace the pixel chunks so the
+		// device's receive buffer isn't flooded. Tune drawChunkSize/drawChunkDelayMs/swapColorOrder here while
+		// bringing up units of this revision.
+		0x0060: {
+			drawChunkSize: 1024,
+			drawChunkDelayMs: 2,
+			sequentialImageWrites: true,
+			swapColorOrder: false,
+		},
+	},
+
 	inputs: [
 		{
 			type: 'button',
