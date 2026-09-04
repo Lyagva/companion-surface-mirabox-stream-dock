@@ -29,6 +29,7 @@ export class StreamDock extends EventEmitter<StreamDockEvents> {
 	private readonly device: HIDAsync
 	private readonly model: StreamDockModelDefinition
 	private heartbeatInterval: NodeJS.Timeout | undefined
+	private writeQueue: Promise<unknown> = Promise.resolve()
 
 	get packetSize(): number {
 		return this.model.packetSize ?? 1024
@@ -92,19 +93,34 @@ export class StreamDock extends EventEmitter<StreamDockEvents> {
 		this.heartbeatInterval = setInterval(() => void this.sendHeartbeat(), 8000)
 	}
 
+	/**
+	 * Runs a write task only once every previously queued write has settled, so bytes belonging to
+	 * different commands/images never interleave on the wire when writes are triggered concurrently.
+	 */
+	private async enqueueWrite<T>(task: () => Promise<T>): Promise<T> {
+		const result = this.writeQueue.then(task, task)
+		this.writeQueue = result.then(
+			() => undefined,
+			() => undefined,
+		)
+		return result
+	}
+
 	private async sendCmdSimple(dataArr: Array<number>): Promise<void> {
-		const data = Buffer.from(dataArr)
+		return this.enqueueWrite(async () => {
+			const data = Buffer.from(dataArr)
 
-		const prefixbuffer = Buffer.from(StreamDock.cmdPrefix)
-		const writebuffer = Buffer.concat([Buffer.from([0]), prefixbuffer, data], this.packetSize + 1)
+			const prefixbuffer = Buffer.from(StreamDock.cmdPrefix)
+			const writebuffer = Buffer.concat([Buffer.from([0]), prefixbuffer, data], this.packetSize + 1)
 
-		if (dataArr.length + prefixbuffer.byteLength > this.packetSize) {
-			console.error(
-				`Data length problem while sending packet to stream dock. Should be ${this.packetSize}B, but is ${dataArr.length + prefixbuffer.byteLength}B`,
-			)
-		}
+			if (dataArr.length + prefixbuffer.byteLength > this.packetSize) {
+				console.error(
+					`Data length problem while sending packet to stream dock. Should be ${this.packetSize}B, but is ${dataArr.length + prefixbuffer.byteLength}B`,
+				)
+			}
 
-		await this.writeRaw(writebuffer)
+			await this.writeRaw(writebuffer)
+		})
 	}
 
 	/**
@@ -115,41 +131,43 @@ export class StreamDock extends EventEmitter<StreamDockEvents> {
 	 * @param prefix optional prefix. If not set, the default prefix will be used
 	 */
 	private async sendDrawKeyCmd(data: Buffer): Promise<void> {
-		const quirks = this.quirks
-		const chunkSize = quirks?.drawChunkSize ?? this.packetSize
+		return this.enqueueWrite(async () => {
+			const quirks = this.quirks
+			const chunkSize = quirks?.drawChunkSize ?? this.packetSize
 
-		if (quirks?.sequentialImageWrites) {
-			// Some hardware revisions drop/blank the frame if pixel chunks arrive out of order or the device's
-			// internal receive buffer is saturated. Write chunks one at a time, pausing briefly between each,
-			// instead of flooding the device with concurrent writes.
-			const chunkDelayMs = quirks.drawChunkDelayMs ?? 0
+			if (quirks?.sequentialImageWrites) {
+				// Some hardware revisions drop/blank the frame if pixel chunks arrive out of order or the device's
+				// internal receive buffer is saturated. Write chunks one at a time, pausing briefly between each,
+				// instead of flooding the device with concurrent writes.
+				const chunkDelayMs = quirks.drawChunkDelayMs ?? 0
+				for (let offset = 0; offset < data.byteLength; offset += chunkSize) {
+					const chunk = data.subarray(offset, offset + chunkSize)
+					const writebuffer = Buffer.concat([Buffer.from([0]), chunk], chunkSize + 1)
+
+					await this.writeRaw(writebuffer).catch((e) => {
+						throw new Error('Sending command to Stream Dock failed ' + e)
+					})
+
+					await delay(chunkDelayMs)
+				}
+				return
+			}
+
+			const ps: Promise<void>[] = []
+
 			for (let offset = 0; offset < data.byteLength; offset += chunkSize) {
 				const chunk = data.subarray(offset, offset + chunkSize)
 				const writebuffer = Buffer.concat([Buffer.from([0]), chunk], chunkSize + 1)
 
-				await this.writeRaw(writebuffer).catch((e) => {
-					throw new Error('Sending command to Stream Dock failed ' + e)
-				})
-
-				await delay(chunkDelayMs)
+				ps.push(
+					this.writeRaw(writebuffer).catch((e) => {
+						throw new Error('Sending command to Stream Dock failed ' + e)
+					}),
+				)
 			}
-			return
-		}
 
-		const ps: Promise<void>[] = []
-
-		for (let offset = 0; offset < data.byteLength; offset += chunkSize) {
-			const chunk = data.subarray(offset, offset + chunkSize)
-			const writebuffer = Buffer.concat([Buffer.from([0]), chunk], chunkSize + 1)
-
-			ps.push(
-				this.writeRaw(writebuffer).catch((e) => {
-					throw new Error('Sending command to Stream Dock failed ' + e)
-				}),
-			)
-		}
-
-		await Promise.all(ps)
+			await Promise.all(ps)
+		})
 	}
 
 	get serialNumber(): string {
